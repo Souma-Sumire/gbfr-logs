@@ -69,6 +69,7 @@ impl IdentityStore {
 
 static IDENTITIES: OnceLock<Mutex<IdentityStore>> = OnceLock::new();
 static ACTOR_KEYS: OnceLock<Mutex<HashMap<usize, u32>>> = OnceLock::new();
+static LOCAL_PLAYER_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone)]
 pub struct OnLoadPlayerIdentityHook {
@@ -134,6 +135,10 @@ impl OnLoadPlayerIdentityHook {
             identity.is_online,
             identity.display_name.to_string_lossy()
         );
+
+        if identity.party_index == 0 && !identity.is_online {
+            LOCAL_PLAYER_KEY.store(player_key, std::sync::atomic::Ordering::Relaxed);
+        }
 
         let mapping_changed = {
             let mut identities = IDENTITIES
@@ -242,28 +247,53 @@ pub fn identity_event_for_actor(
             .get(&player_key)
             .cloned()
     } else {
-            .get_or_init(|| Mutex::new(IdentityStore::default()))
-            .lock()
-            .expect("player identity map lock poisoned")
-            .by_key
-            .get(&player_key)
-            .cloned()?;
+        if let Some(player_key) = read_actor_player_key(actor) {
+            let identity = IDENTITIES
+                .get_or_init(|| Mutex::new(IdentityStore::default()))
+                .lock()
+                .expect("player identity map lock poisoned")
+                .by_key
+                .get(&player_key)
+                .cloned();
 
-        info!(
-            "Player actor matched: actor={actor:p}, type={character_type:#010x}, key={player_key:#010x}, offset={ACTOR_PLAYER_KEY_OFFSET:#x}, name={}",
-            identity.display_name.to_string_lossy()
-        );
-
-        ACTOR_KEYS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .expect("actor identity map lock poisoned")
-            .insert(actor_address, player_key);
-
-        (player_key, identity)
+            if identity.is_some() {
+                ACTOR_KEYS
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("actor identity map lock poisoned")
+                    .insert(actor_address, player_key);
+            }
+            identity
+        } else {
+            None
+        }
     };
 
     let identity = match identity_opt {
+        Some(mut id) => {
+            let player_key = read_actor_player_key(actor).unwrap_or(0);
+            let is_local_player = player_key != 0 && player_key == LOCAL_PLAYER_KEY.load(std::sync::atomic::Ordering::Relaxed);
+            
+            if is_online || is_local_player {
+                id.party_index = party_index;
+                id.is_online = is_online;
+                id
+            } else {
+                StoredPlayerIdentity {
+                    character_name: CString::new("").unwrap(),
+                    display_name: CString::new("").unwrap(),
+                    party_index,
+                    is_online: false,
+                }
+            }
+        }
+        None => StoredPlayerIdentity {
+            character_name: CString::new("").unwrap(),
+            display_name: CString::new("").unwrap(),
+            party_index,
+            is_online: false,
+        },
+    };
 
     Some(PlayerIdentityEvent {
         character_name: identity.character_name,
