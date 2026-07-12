@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     ffi::{c_void, CString},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
 };
 
 use anyhow::{anyhow, Result};
@@ -168,23 +171,46 @@ fn should_cache_identity(identity: &StoredPlayerIdentity) -> bool {
 /// Resolves a cached identity against the concrete actor used by the damage
 /// hook. ReadProcessMemory turns an invalid or short actor range into a failed
 /// read instead of an in-process access violation.
+///
+/// Returns the identity event (if the actor is valid) and a raw memory dump
+/// for debugging offset/reading issues.
 pub fn identity_event_for_actor(
     actor: *const usize,
     character_type: u32,
     actor_index: u32,
-) -> Option<PlayerIdentityEvent> {
+) -> (Option<PlayerIdentityEvent>, protocol::ActorMemoryDump) {
+    // Build a memory dump that captures every raw read so we can diagnose
+    // offset mismatches from the frontend dump.
+    let mut dump = protocol::ActorMemoryDump {
+        actor_address: actor as u64,
+        actor_index,
+        character_type,
+        sigil_offset: crate::hooks::globals::SIGIL_OFFSET.load(std::sync::atomic::Ordering::Relaxed),
+        sigil_data_ptr_value: 0,
+        sigil_bytes_read: 0,
+        has_sigil_data: false,
+        party_index_raw: 0,
+        is_online_raw: 0,
+        party_index_sent: u8::MAX,
+        is_online_sent: false,
+        player_key: 0,
+        cached_identity_found: false,
+    };
+
     if actor.is_null() {
-        return None;
+        return (None, dump);
     }
 
     let actor_address = actor as usize;
+    dump.actor_address = actor_address as u64;
 
     let sigil_offset = crate::hooks::globals::SIGIL_OFFSET.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    dump.sigil_offset = sigil_offset as u32;
     
     let mut sigil_data_ptr = 0usize;
     let mut bytes_read = 0usize;
     let has_sigil_data = if sigil_offset != 0 {
-        let _ = unsafe {
+        let read_ok = unsafe {
             ReadProcessMemory(
                 HANDLE(-1),
                 actor.byte_add(sigil_offset).cast::<c_void>(),
@@ -193,10 +219,26 @@ pub fn identity_event_for_actor(
                 Some(&mut bytes_read),
             )
         };
-        sigil_data_ptr != 0 && bytes_read == std::mem::size_of::<usize>()
+        let ok = read_ok.is_ok() && sigil_data_ptr != 0 && bytes_read == std::mem::size_of::<usize>();
+
+        dump.sigil_data_ptr_value = sigil_data_ptr as u64;
+        dump.sigil_bytes_read = bytes_read as u32;
+        dump.has_sigil_data = ok;
+
+        static SIGIL_DIAG_LOGGED: AtomicBool = AtomicBool::new(false);
+        if !ok && !SIGIL_DIAG_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "identity_event_for_actor: sigil read FAILED — actor={:#x} sigil_offset={:#x} ptr={:#x} bytes_read={} read_ok={}. Offsets may be wrong for this game version!",
+                actor_address, sigil_offset, sigil_data_ptr, bytes_read, read_ok.is_ok()
+            );
+        }
+        ok
     } else {
         false
     };
+
+    let mut is_online_raw = 0u32;
+    let mut party_index_raw = 0u32;
 
     let (is_online, party_index) = if has_sigil_data {
         let mut is_online_val = 0u32;
@@ -210,6 +252,7 @@ pub fn identity_event_for_actor(
             )
         };
         let is_online = is_online_val == 1;
+        is_online_raw = is_online_val;
 
         let mut party_index_val = 0u32;
         let _ = unsafe {
@@ -221,15 +264,21 @@ pub fn identity_event_for_actor(
                 None,
             )
         };
+        party_index_raw = party_index_val;
         
         let mut party_index = party_index_val as u8;
         if party_index > 3 {
-            party_index = 1;
+            party_index = u8::MAX;
         }
         (is_online, party_index)
     } else {
-        (false, 1u8)
+        (false, u8::MAX)
     };
+
+    dump.is_online_raw = is_online_raw;
+    dump.party_index_raw = party_index_raw;
+    dump.party_index_sent = party_index;
+    dump.is_online_sent = is_online;
 
     let cached_key = ACTOR_KEYS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -248,6 +297,7 @@ pub fn identity_event_for_actor(
             .cloned()
     } else {
         if let Some(player_key) = read_actor_player_key(actor) {
+            dump.player_key = player_key;
             let identity = IDENTITIES
                 .get_or_init(|| Mutex::new(IdentityStore::default()))
                 .lock()
@@ -269,9 +319,12 @@ pub fn identity_event_for_actor(
         }
     };
 
+    dump.cached_identity_found = identity_opt.is_some();
+
     let identity = match identity_opt {
         Some(mut id) => {
             let player_key = read_actor_player_key(actor).unwrap_or(0);
+            dump.player_key = player_key;
             let is_local_player = player_key != 0 && player_key == LOCAL_PLAYER_KEY.load(std::sync::atomic::Ordering::Relaxed);
             
             if is_online || is_local_player {
@@ -287,22 +340,28 @@ pub fn identity_event_for_actor(
                 }
             }
         }
-        None => StoredPlayerIdentity {
-            character_name: CString::new("").unwrap(),
-            display_name: CString::new("").unwrap(),
-            party_index,
-            is_online: false,
-        },
+        None => {
+            let pk = read_actor_player_key(actor).unwrap_or(0);
+            dump.player_key = pk;
+            StoredPlayerIdentity {
+                character_name: CString::new("").unwrap(),
+                display_name: CString::new("").unwrap(),
+                party_index,
+                is_online: false,
+            }
+        }
     };
 
-    Some(PlayerIdentityEvent {
+    let event = PlayerIdentityEvent {
         character_name: identity.character_name,
         display_name: identity.display_name,
         character_type,
         party_index: identity.party_index,
         actor_index,
         is_online: identity.is_online,
-    })
+    };
+
+    (Some(event), dump)
 }
 
 fn read_actor_player_key(actor: *const usize) -> Option<u32> {

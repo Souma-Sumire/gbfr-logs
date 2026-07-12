@@ -95,17 +95,25 @@ impl OnProcessDamageHook {
         let source_type_id = actor_type_id(source_specified_instance_ptr as *const usize);
         let source_idx = actor_idx(source_specified_instance_ptr as *const usize);
 
-        if let Some(identity) = super::player::identity_event_for_actor(
+        let (identity_opt, memory_dump) = super::player::identity_event_for_actor(
             source_specified_instance_ptr as *const usize,
             source_type_id,
             source_idx,
-        ) {
+        );
+
+        // Always send the raw memory dump for diagnostics.
+        let _ = self.tx.send(Message::DebugActorMemory(memory_dump));
+
+        // Send the identity event if resolved.
+        if let Some(identity) = identity_opt {
             let _ = self.tx.send(Message::PlayerIdentityEvent(identity));
         }
 
-        // Parent layouts are character-specific and changed in the 2.0 update. Keep the
-        // source attributed to the concrete actor until those optional offsets are verified.
-        let (source_parent_type_id, source_parent_idx) = (source_type_id, source_idx);
+        // Resolve the owning player for pets and transformations (e.g. Id's dragon form
+        // Pl2000 → Pl1900). Falls back to the source itself when no parent mapping exists.
+        let (source_parent_type_id, source_parent_idx) =
+            get_source_parent(source_type_id, source_specified_instance_ptr as *const usize)
+                .unwrap_or((source_type_id, source_idx));
 
         let target_type_id: u32 = actor_type_id(target_specified_instance_ptr as *const usize);
         let target_idx = actor_idx(target_specified_instance_ptr as *const usize);

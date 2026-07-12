@@ -186,29 +186,31 @@ struct Sigil {
 #[serde(rename_all = "camelCase")]
 pub struct PlayerData {
     /// Actor index for this player
-    actor_index: u32,
+    pub actor_index: u32,
+    /// Party slot index (0-3) for this player
+    pub party_index: u8,
     /// Display name for this player, empty if its an NPC
-    display_name: String,
+    pub display_name: String,
     /// Character name for this player if it's an NPC, otherwise it is the same as display_name
-    character_name: String,
+    pub character_name: String,
     /// Character type for this player
-    character_type: CharacterType,
+    pub character_type: CharacterType,
     /// Sigils that this player has equipped
-    sigils: Vec<Sigil>,
+    pub sigils: Vec<Sigil>,
     /// Whether this player was an online player or not
-    is_online: bool,
+    pub is_online: bool,
     /// Weapon info for this player
-    weapon_info: Option<WeaponInfo>,
+    pub weapon_info: Option<WeaponInfo>,
     /// Overmastery info for this player
-    overmastery_info: Option<OvermasteryInfo>,
+    pub overmastery_info: Option<OvermasteryInfo>,
     /// Player stats for this player
-    player_stats: Option<PlayerStats>,
+    pub player_stats: Option<PlayerStats>,
 }
 
 /// Derived breakdown for an enemy target
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EnemyState {
+pub struct EnemyState {
     index: u32,
     target_type: EnemyType,
     raw_target_type: u32,
@@ -285,7 +287,7 @@ impl Encounter {
 
 /// The status of the parser.
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, PartialOrd, Clone, Copy)]
-enum ParserStatus {
+pub enum ParserStatus {
     #[default]
     Waiting,
     InProgress,
@@ -302,23 +304,23 @@ const AUTO_SAVE_INACTIVITY_MS: i64 = 60_000;
 #[serde(rename_all = "camelCase")]
 pub struct DerivedEncounterState {
     /// Timestamp of the first damage event
-    start_time: i64,
+    pub start_time: i64,
     /// Timestamp of the last damage event (or the last known damage event if the encounter is still in progress)
-    end_time: i64,
+    pub end_time: i64,
     /// The total damage done in the encounter
-    total_damage: u64,
+    pub total_damage: u64,
     /// The total DPS done in the encounter
-    dps: f64,
+    pub dps: f64,
     /// The total stun value done in the encounter
-    total_stun_value: f64,
+    pub total_stun_value: f64,
     /// The total stun value per second done in the encounter
-    stun_per_second: f64,
+    pub stun_per_second: f64,
     /// Status of the parser
-    status: ParserStatus,
+    pub status: ParserStatus,
     /// Derived party stats
     pub party: HashMap<u32, PlayerState>,
     /// Derived target stats, damage done to each target.
-    targets: HashMap<u32, EnemyState>,
+    pub targets: HashMap<u32, EnemyState>,
 }
 
 impl Default for DerivedEncounterState {
@@ -369,11 +371,13 @@ impl DerivedEncounterState {
         self.stun_per_second = self.total_stun_value / ((self.duration()) as f64 / 1000.0);
 
         // Add actor to party if not already present.
+        let party_slot = damage_instance.player_data.map(|pd| pd.party_index);
         let source_player = self
             .party
             .entry(damage_instance.event.source.parent_index)
             .or_insert(PlayerState {
                 index: damage_instance.event.source.parent_index,
+                party_index: party_slot,
                 character_type: CharacterType::from_hash(
                     damage_instance.event.source.parent_actor_type,
                 ),
@@ -385,6 +389,11 @@ impl DerivedEncounterState {
                 skill_breakdown: Vec::new(),
                 last_known_pet_skill: None,
             });
+
+        // If the player state was already present but had no party_index, fill it in.
+        if source_player.party_index.is_none() {
+            source_player.party_index = party_slot;
+        }
 
         // Update player stats from damage event.
         source_player.update_from_damage_event(damage_instance);
@@ -418,6 +427,11 @@ pub struct Parser {
     pub derived_state: DerivedEncounterState,
     /// Status of the parser
     status: ParserStatus,
+
+    /// Raw memory dumps from the hook for debugging offset/reading issues.
+    /// Collected during live parsing and exposed via get_dump_diagnostics.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actor_memory_dumps: Vec<protocol::ActorMemoryDump>,
 
     /// The window handle for the parser, used to send messages to the front-end
     #[serde(skip)]
@@ -770,6 +784,7 @@ impl Parser {
 
         let player_data = PlayerData {
             actor_index: event.actor_index,
+            party_index: event.party_index,
             display_name: event.display_name.to_string_lossy().to_string(),
             character_name: event.character_name.to_string_lossy().to_string(),
             is_online: event.is_online,
@@ -786,7 +801,10 @@ impl Parser {
     pub fn on_player_identity_event(&mut self, event: PlayerIdentityEvent) {
         let character_type = CharacterType::from_hash(event.character_type);
 
-        if character_type == CharacterType::Pl2000 {
+        // Ignore Id's transformation and non-player entities.
+        if character_type == CharacterType::Pl2000
+            || matches!(character_type, CharacterType::Unknown(_))
+        {
             return;
         }
 
@@ -799,6 +817,7 @@ impl Parser {
             .cloned()
             .unwrap_or(PlayerData {
                 actor_index: event.actor_index,
+                party_index: event.party_index,
                 display_name: String::new(),
                 character_name: String::new(),
                 character_type,
@@ -813,6 +832,21 @@ impl Parser {
         player_data.character_name = event.character_name.to_string_lossy().to_string();
         player_data.character_type = character_type;
         player_data.is_online = event.is_online;
+        player_data.party_index = event.party_index;
+
+        // Propagate party_index to matching PlayerState in the party.
+        // Try exact actor_index match first, then fallback to character type match
+        // (actor indices can diverge when game reuses actor instances).
+        if let Some(player) = self.derived_state.party.get_mut(&event.actor_index) {
+            player.party_index = Some(event.party_index);
+        } else {
+            for player in self.derived_state.party.values_mut() {
+                if player.character_type == character_type && player.party_index.is_none() {
+                    player.party_index = Some(event.party_index);
+                    break;
+                }
+            }
+        }
 
         self.insert_player_data(player_data, event.party_index);
     }
@@ -838,8 +872,10 @@ impl Parser {
             }
         }
 
-        // Write into the decided slot.
-        if target_index < 4 {
+        // Write into the decided slot. Only overwrite if the slot is actually free —
+        // when party_index is unreliable (e.g. all offline players default to slot 1),
+        // this prevents a late-arriving identity from evicting a previously stored player.
+        if target_index < 4 && self.encounter.player_data[target_index].is_none() {
             self.encounter.player_data[target_index] = Some(player_data);
         }
 

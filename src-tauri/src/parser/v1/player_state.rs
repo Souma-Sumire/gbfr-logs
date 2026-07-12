@@ -10,6 +10,9 @@ use super::{skill_state::SkillState, AdjustedDamageInstance};
 #[serde(rename_all = "camelCase")]
 pub struct PlayerState {
     pub index: u32,
+    /// Actual party slot (0-3), if known from identity events
+    #[serde(default)]
+    pub party_index: Option<u8>,
     pub character_type: CharacterType,
     pub total_damage: u64,
     pub last_known_pet_skill: Option<ActionType>, // used for Ferry's skills that don't keep track of where they came from
@@ -34,8 +37,11 @@ impl PlayerState {
     pub fn get_action_from_ferry_damage_event(&mut self, event: &DamageEvent) -> ActionType {
         // Ferry needs special handling because the action_id that comes back for pet skills is usually wrong
         // e.g. if you strafe then dodge the action_id for further hits comes back as "dodge"
-        let is_ferry_pet =
-            CharacterType::Pl0700Ghost == CharacterType::from_hash(event.source.actor_type);
+        let is_ferry_pet = {
+            let source = CharacterType::from_hash(event.source.actor_type);
+            source == CharacterType::Pl0700Ghost
+                || source == CharacterType::Pl0700GhostSatellite
+        };
         let is_ferry_pet_skill = is_ferry_pet && (event.flags & (1 << 2) != 0); // pet skills for ferry always have this flag set
         let is_ferry_pet_normal =
             is_ferry_pet && !is_ferry_pet_skill && event.action_id != ActionType::LinkAttack;
@@ -76,11 +82,28 @@ impl PlayerState {
         let parent_character_type =
             CharacterType::from_hash(damage_instance.event.source.parent_actor_type);
 
-        // @TODO(false): Collapse all skill IDs from Seofon's avatar into his own.
-        let child_character_type = if parent_character_type == CharacterType::Pl2200 {
-            parent_character_type
-        } else {
-            CharacterType::from_hash(damage_instance.event.source.actor_type)
+        // Collapse pet/transformation skill IDs into their owning character.
+        // Pl2000 (Id's dragon form) → Pl1900; Ferry's pets → Pl0700;
+        // Seofon's avatar → Pl2200.
+        let child_character_type = match parent_character_type {
+            CharacterType::Pl2200 => parent_character_type,
+            CharacterType::Pl1900
+                if CharacterType::from_hash(damage_instance.event.source.actor_type)
+                    == CharacterType::Pl2000 =>
+            {
+                CharacterType::Pl1900
+            }
+            CharacterType::Pl0700 => {
+                let source = CharacterType::from_hash(damage_instance.event.source.actor_type);
+                if source == CharacterType::Pl0700Ghost
+                    || source == CharacterType::Pl0700GhostSatellite
+                {
+                    CharacterType::Pl0700
+                } else {
+                    source
+                }
+            }
+            _ => CharacterType::from_hash(damage_instance.event.source.actor_type),
         };
 
         // for ferry defer to special function to handle the weird way her pets work
@@ -127,6 +150,7 @@ mod tests {
     fn calculates_dps() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 100,
             last_known_pet_skill: None,
@@ -146,6 +170,7 @@ mod tests {
     fn updates_from_damage_event() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,
@@ -191,6 +216,7 @@ mod tests {
     fn same_skill_updates_from_multiple_damage_events() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,
@@ -244,6 +270,7 @@ mod tests {
     fn new_skills_are_tracked_separately() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,
@@ -313,6 +340,7 @@ mod tests {
     fn skills_from_children_are_tracked_separately() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,
@@ -388,6 +416,7 @@ mod tests {
     fn stun_is_tracked_with_player_stats() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,
@@ -421,6 +450,7 @@ mod tests {
 
         let player_data = PlayerData {
             actor_index: 0,
+            party_index: 0,
             character_type: CharacterType::Pl0000,
             display_name: "Test".to_string(),
             character_name: "Test".to_string(),
@@ -450,6 +480,7 @@ mod tests {
     fn stun_value_without_player_stats() {
         let mut player_state = PlayerState {
             index: 0,
+            party_index: None,
             character_type: CharacterType::Pl0000,
             total_damage: 0,
             last_known_pet_skill: None,

@@ -43,6 +43,7 @@ import {
   exportFullEncounterToClipboard,
   exportScreenshotToClipboard,
   exportSimpleEncounterToClipboard,
+  findPartySlotIndex,
   formatInPartyOrder,
   humanizeNumbers,
   millisecondsToElapsedFormat,
@@ -254,7 +255,7 @@ export const ViewPage = () => {
   const data = [];
   const sbaData = [];
 
-  const players = formatInPartyOrder(encounter.party);
+  const players = formatInPartyOrder(encounter.party, playerData);
 
   for (let i = 0; i < chartLen + 1; i++) {
     const datapoint: {
@@ -269,7 +270,7 @@ export const ViewPage = () => {
 
     for (const playerIndex in dpsChart) {
       const player = players.find((p) => p.index === Number(playerIndex));
-      const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player?.index);
+      const partySlotIndex = player ? findPartySlotIndex(player, playerData) : -1;
       const playerName = translatedPlayerName(
         partySlotIndex,
         playerData[partySlotIndex],
@@ -301,7 +302,7 @@ export const ViewPage = () => {
 
     for (const playerIndex in sbaChart) {
       const player = players.find((p) => p.index === Number(playerIndex));
-      const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player?.index);
+      const partySlotIndex = player ? findPartySlotIndex(player, playerData) : -1;
       const playerName = translatedPlayerName(
         partySlotIndex,
         playerData[partySlotIndex],
@@ -317,7 +318,7 @@ export const ViewPage = () => {
   }
 
   const labels: Label = players.map((player) => {
-    const partySlotIndex = playerData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+    const partySlotIndex = findPartySlotIndex(player, playerData);
     const color = partySlotIndex !== -1 ? playerColors[partySlotIndex] : playerColors[player.partyIndex];
 
     return {

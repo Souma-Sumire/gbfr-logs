@@ -7,11 +7,14 @@ import { useTranslation } from "react-i18next";
 import toast from "react-hot-toast";
 
 import getVersion from "@/hooks/getVersion";
+import { useMeterSettingsStore } from "@/stores/useMeterSettingsStore";
 import { EncounterState, PlayerData, SortDirection, SortType } from "@/types";
 import {
   exportFullEncounterToClipboard,
   exportScreenshotToClipboard,
   exportSimpleEncounterToClipboard,
+  findPartySlotIndex,
+  formatInPartyOrder,
   humanizeNumbers,
   millisecondsToElapsedFormat,
 } from "@/utils";
@@ -91,12 +94,94 @@ export const Titlebar = ({
     exportFullEncounterToClipboard(sortType, sortDirection, encounterState, partyData);
   }, [encounterState]);
 
-  const handleDumpDebugInfo = useCallback(() => {
+  const handleDumpDebugInfo = useCallback(async () => {
+    const settings = useMeterSettingsStore.getState();
+
+    // Build diagnostic info about player matching
+    const orderedPlayers = formatInPartyOrder(encounterState.party, partyData);
+    const matchDiagnostics = orderedPlayers.map((player) => {
+      const matchedSlot = findPartySlotIndex(player, partyData);
+      const usedBackendPartyIndex =
+        player.partyIndex !== undefined &&
+        player.partyIndex >= 0 &&
+        player.partyIndex < 4 &&
+        partyData[player.partyIndex] &&
+        typeof partyData[player.partyIndex]?.characterType === 'string' &&
+        partyData[player.partyIndex]?.characterType === player.characterType;
+      const usedActorIndex =
+        !usedBackendPartyIndex &&
+        partyData.findIndex((pm) => pm?.actorIndex === player.index) !== -1;
+      const usedCharacterTypeFallback = !usedBackendPartyIndex && !usedActorIndex && matchedSlot !== -1;
+
+      return {
+        playerIndex: player.index,
+        characterType: player.characterType,
+        assignedPartyIndex: player.partyIndex,
+        matchedPartySlot: matchedSlot,
+        matchMethod: usedBackendPartyIndex
+          ? 'backend_party_index'
+          : usedActorIndex
+            ? 'actor_index'
+            : usedCharacterTypeFallback
+              ? 'character_type_fallback'
+              : 'none',
+        totalDamage: player.totalDamage,
+      };
+    });
+
+    // Summarize partyData
+    const partyDataSummary = partyData.map((pd, i) =>
+      pd
+        ? {
+            slot: i,
+            actorIndex: pd.actorIndex,
+            partyIndex: pd.partyIndex,
+            characterType: pd.characterType,
+            displayName: pd.displayName || '(empty)',
+            isOnline: pd.isOnline,
+          }
+        : { slot: i, empty: true }
+    );
+
+    // Try to get backend diagnostics (only available in logs view with a valid log ID)
+    let backendDiagnostics = null;
+    try {
+      // Extract log ID from URL path if we're on the logs page (/logs/:id)
+      const pathMatch = window.location.pathname.match(/\/logs\/(\d+)/);
+      const logId = pathMatch ? pathMatch[1] : null;
+      if (logId) {
+        backendDiagnostics = await invoke('get_dump_diagnostics', {
+          id: Number(logId),
+        });
+      }
+    } catch {
+      // Backend diagnostics not available (live meter or no log loaded)
+    }
+
     const debugInfo = {
       timestamp: Date.now(),
+      version,
+      platform: {
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+      },
+      settings: {
+        color_1: settings.color_1,
+        color_2: settings.color_2,
+        color_3: settings.color_3,
+        color_4: settings.color_4,
+        show_display_names: settings.show_display_names,
+        streamer_mode: settings.streamer_mode,
+        show_full_values: settings.show_full_values,
+        overlay_columns: settings.overlay_columns,
+      },
       encounterState,
       partyData,
+      partyDataSummary,
+      matchDiagnostics,
+      backendDiagnostics,
     };
+
     navigator.clipboard.writeText(JSON.stringify(debugInfo, null, 2))
       .then(() => {
         toast.success("Debug info copied! Paste it to Antigravity.");
@@ -104,7 +189,7 @@ export const Titlebar = ({
       .catch((err) => {
         toast.error("Failed to copy debug info: " + err);
       });
-  }, [encounterState, partyData]);
+  }, [encounterState, partyData, version]);
 
   return (
     <div data-tauri-drag-region className="titlebar transparent-bg font-sm">

@@ -279,6 +279,182 @@ fn fetch_logs(
     })
 }
 
+/// Diagnostic information about the current parser state, exposed for
+/// debugging player-classification and data-mismatch issues.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DumpDiagnostics {
+    /// Version of the application
+    app_version: String,
+    /// Number of raw events in the encounter log
+    raw_event_count: usize,
+    /// Number of damage events in the encounter log
+    damage_event_count: usize,
+    /// Number of PlayerIdentity events in the encounter log
+    identity_event_count: usize,
+    /// Number of DebugActorMemory dumps collected
+    memory_dump_count: usize,
+    /// Summary of player_data slots (slot index → actor_index, character_type, is_online)
+    player_data_summary: Vec<PlayerDataSlotSummary>,
+    /// Summary of party state (each player in DerivedEncounterState.party)
+    party_summary: Vec<PartyPlayerSummary>,
+    /// Parser status
+    parser_status: String,
+    /// Total damage tracked
+    total_damage: u64,
+    /// Duration in milliseconds
+    duration_ms: i64,
+    /// Raw memory dumps from the hook — shows exact bytes read at each offset.
+    /// Deduplicated by actor_index (keeps first dump per actor).
+    actor_memory_dumps: Vec<ActorMemoryDumpEntry>,
+}
+
+/// Serialisable snapshot of a single ActorMemoryDump for the frontend.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActorMemoryDumpEntry {
+    actor_address: String,
+    actor_index: u32,
+    character_type: String,
+    character_type_hash: u32,
+    sigil_offset: String,
+    sigil_data_ptr_value: String,
+    sigil_bytes_read: u32,
+    has_sigil_data: bool,
+    party_index_raw: u32,
+    is_online_raw: u32,
+    party_index_sent: u8,
+    is_online_sent: bool,
+    player_key: String,
+    cached_identity_found: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlayerDataSlotSummary {
+    slot: usize,
+    actor_index: u32,
+    party_index: u8,
+    character_type: String,
+    display_name: String,
+    is_online: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartyPlayerSummary {
+    key: u32,
+    character_type: String,
+    total_damage: u64,
+    party_index: Option<u8>,
+}
+
+#[tauri::command]
+fn get_dump_diagnostics(
+    id: u64,
+    app_handle: AppHandle,
+) -> Result<DumpDiagnostics, String> {
+    let conn = db::connect_to_db().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT data, version FROM logs WHERE id = ?")
+        .map_err(|e| e.to_string())?;
+
+    let (blob, version): (Vec<u8>, u8) = stmt
+        .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .context("Failed to fetch log from database")
+        .map_err(|e| e.to_string())?;
+
+    let parser = parser::deserialize_version(&blob, version).map_err(|e| e.to_string())?;
+
+    // Count event types
+    let mut damage_event_count = 0usize;
+    let mut identity_event_count = 0usize;
+    for (_ts, event) in parser.encounter.event_log() {
+        match event {
+            Message::DamageEvent(_) => damage_event_count += 1,
+            Message::PlayerIdentityEvent(_) => identity_event_count += 1,
+            _ => {}
+        }
+    }
+
+    // Summarize player_data
+    let player_data_summary: Vec<PlayerDataSlotSummary> = parser
+        .encounter
+        .player_data
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, pd)| {
+            pd.as_ref().map(|p| PlayerDataSlotSummary {
+                slot,
+                actor_index: p.actor_index,
+                party_index: p.party_index,
+                character_type: p.character_type.to_string(),
+                display_name: p.display_name.clone(),
+                is_online: p.is_online,
+            })
+        })
+        .collect();
+
+    // Summarize party
+    let party_summary: Vec<PartyPlayerSummary> = parser
+        .derived_state
+        .party
+        .iter()
+        .map(|(key, player)| PartyPlayerSummary {
+            key: *key,
+            character_type: player.character_type.to_string(),
+            total_damage: player.total_damage,
+            party_index: player.party_index,
+        })
+        .collect();
+
+    // Deduplicate memory dumps: keep only the first dump per actor_index
+    let mut seen_actors = std::collections::HashSet::new();
+    let actor_memory_dumps: Vec<ActorMemoryDumpEntry> = parser
+        .actor_memory_dumps
+        .iter()
+        .filter(|d| seen_actors.insert(d.actor_index))
+        .map(|d| ActorMemoryDumpEntry {
+            actor_address: format!("{:#018x}", d.actor_address),
+            actor_index: d.actor_index,
+            character_type: crate::parser::constants::CharacterType::from_hash(d.character_type)
+                .to_string(),
+            character_type_hash: d.character_type,
+            sigil_offset: format!("{:#x}", d.sigil_offset),
+            sigil_data_ptr_value: format!("{:#018x}", d.sigil_data_ptr_value),
+            sigil_bytes_read: d.sigil_bytes_read,
+            has_sigil_data: d.has_sigil_data,
+            party_index_raw: d.party_index_raw,
+            is_online_raw: d.is_online_raw,
+            party_index_sent: d.party_index_sent,
+            is_online_sent: d.is_online_sent,
+            player_key: format!("{:#010x}", d.player_key),
+            cached_identity_found: d.cached_identity_found,
+        })
+        .collect();
+
+    let app_version = app_handle
+        .config()
+        .package
+        .version
+        .clone()
+        .unwrap_or_else(|| "unknown".into());
+
+    Ok(DumpDiagnostics {
+        app_version,
+        raw_event_count: parser.encounter.raw_event_log.len(),
+        damage_event_count,
+        identity_event_count,
+        memory_dump_count: parser.actor_memory_dumps.len(),
+        player_data_summary,
+        party_summary,
+        parser_status: format!("{:?}", parser.derived_state.status),
+        total_damage: parser.derived_state.total_damage,
+        duration_ms: parser.derived_state.duration(),
+        actor_memory_dumps,
+    })
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EncounterStateResponse {
@@ -495,6 +671,9 @@ fn connect_and_run_parser(app: AppHandle) {
                                         protocol::Message::PlayerIdentityEvent(event) => {
                                             state.on_player_identity_event(event);
                                         }
+                                        protocol::Message::DebugActorMemory(dump) => {
+                                            state.actor_memory_dumps.push(dump);
+                                        }
                                         protocol::Message::OnQuestComplete(event) => {
                                             state.on_quest_complete_event(event);
                                         }
@@ -701,6 +880,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             fetch_encounter_state,
+            get_dump_diagnostics,
             fetch_logs,
             delete_logs,
             delete_all_logs,

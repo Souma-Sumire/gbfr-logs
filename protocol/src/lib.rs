@@ -238,4 +238,39 @@ pub enum Message {
     OnBattleEnd,
     /// Player name and actor mapping without version-sensitive equipment data.
     PlayerIdentityEvent(PlayerIdentityEvent),
+    /// Raw memory dump from the hook for debugging offset/reading issues.
+    DebugActorMemory(ActorMemoryDump),
+}
+
+/// Diagnostic snapshot of raw memory reads performed during identity resolution.
+/// Sent alongside every PlayerIdentityEvent so the dump can reveal whether
+/// game offsets are correct.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ActorMemoryDump {
+    /// Actor base address (source_specified_instance_ptr)
+    pub actor_address: u64,
+    /// Sequential actor index from ACTOR_IDS
+    pub actor_index: u32,
+    /// Character type hash
+    pub character_type: u32,
+    /// SIGIL_OFFSET value used
+    pub sigil_offset: u32,
+    /// Value read at actor + sigil_offset (the sigil data pointer)
+    pub sigil_data_ptr_value: u64,
+    /// Bytes read by ReadProcessMemory for sigil pointer
+    pub sigil_bytes_read: u32,
+    /// Whether the sigil data read succeeded (ptr != 0 && bytes == 8)
+    pub has_sigil_data: bool,
+    /// Raw u32 read from sigil_data + 0x230 (party_index)
+    pub party_index_raw: u32,
+    /// Raw u32 read from sigil_data + 0x1C8 (is_online)
+    pub is_online_raw: u32,
+    /// Final party_index sent in the identity event
+    pub party_index_sent: u8,
+    /// Final is_online sent in the identity event
+    pub is_online_sent: bool,
+    /// Player key read from actor + ACTOR_PLAYER_KEY_OFFSET (0 if failed)
+    pub player_key: u32,
+    /// Whether a cached identity was found for this actor
+    pub cached_identity_found: bool,
 }

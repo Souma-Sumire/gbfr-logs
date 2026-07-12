@@ -2,7 +2,7 @@ import { useTranslation } from "react-i18next";
 import { useShallow } from "zustand/react/shallow";
 import { useMeterSettingsStore } from "../stores/useMeterSettingsStore";
 import { ComputedPlayerState, EncounterState, MeterColumns, PlayerData, SortDirection, SortType } from "../types";
-import { formatInPartyOrder, sortPlayers } from "../utils";
+import { findPartySlotIndex, formatInPartyOrder, sortPlayers } from "../utils";
 import { PlayerRow } from "./PlayerRow";
 
 export const Table = ({
@@ -32,7 +32,7 @@ export const Table = ({
     }))
   );
 
-  const partyOrderPlayers = formatInPartyOrder(encounterState.party);
+  const partyOrderPlayers = formatInPartyOrder(encounterState.party, partyData);
   let players: Array<ComputedPlayerState> = partyOrderPlayers.map((playerData) => {
     return {
       ...playerData,
@@ -44,7 +44,7 @@ export const Table = ({
   sortPlayers(players, sortType, sortDirection);
 
   players = players.filter((player) => {
-    const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+    const partySlotIndex = findPartySlotIndex(player, partyData);
 
     // If streamer mode is ON, then only show the first party slot (the streamer's character)
     // Otherwise, show all players.

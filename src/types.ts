@@ -85,6 +85,8 @@ export type ComputedSkillGroup = {
 export type PlayerState = {
   /** Unique ID for this player */
   index: number;
+  /** Actual party slot index (0-3), if known from identity data */
+  partyIndex?: number;
   /** Character type of this player. (Pl1000 / Pl1800 / ..) */
   characterType: CharacterType;
   /** Total damage dealt */
@@ -198,6 +200,7 @@ export type PlayerStats = {
 
 export type PlayerData = {
   actorIndex: number;
+  partyIndex: number;
   displayName: string;
   characterName: string;
   characterType: CharacterType;

@@ -39,18 +39,61 @@ export const getSkillTranslationKeys = (characterType: CharacterType, skillID: n
   return keys;
 };
 
-export const formatInPartyOrder = (party: Record<string, PlayerState>): ComputedPlayerState[] => {
+export const formatInPartyOrder = (
+  party: Record<string, PlayerState>,
+  partyData?: Array<PlayerData | null>
+): ComputedPlayerState[] => {
   const players = Object.keys(party).map((key) => {
     return party[key];
   });
 
   players.sort((a, b) => a.index - b.index);
 
-  return players.map((player, i) => ({
-    partyIndex: i,
-    percentage: 0,
-    ...player,
-  }));
+  // Greedy slot assignment: each player gets a unique partyData slot.
+  // This prevents duplicate character types from colliding on the same slot.
+  const usedSlots = new Set<number>();
+  const assignedSlots = players.map((player) => {
+    // 1. Try actor_index + character_type match with an unused slot.
+    //    Both must agree — stale partyData can have wrong character types at old indices.
+    let slot = partyData?.findIndex(
+      (pm, i) =>
+        pm?.actorIndex === player.index &&
+        !usedSlots.has(i) &&
+        typeof pm.characterType === 'string' &&
+        typeof player.characterType === 'string' &&
+        pm.characterType === player.characterType
+    ) ?? -1;
+    // 2. Try character type match with an unused slot
+    if (slot === -1 && partyData) {
+      const candidates = partyData
+        .map((pm, i) => ({ pm, i }))
+        .filter(
+          ({ pm, i }) =>
+            !usedSlots.has(i) &&
+            typeof pm?.characterType === 'string' &&
+            typeof player.characterType === 'string' &&
+            pm.characterType === player.characterType
+        );
+      if (candidates.length === 1) {
+        slot = candidates[0].i;
+      }
+    }
+    if (slot !== -1) {
+      usedSlots.add(slot);
+    }
+    return slot;
+  });
+
+  return players.map((player, i) => {
+    const { partyIndex: backendPartyIndex, ...rest } = player;
+    return {
+      // Greedily-assigned slot (unique). Falls back to sequential index —
+      // backend party_index is unreliable when sigil offsets are wrong.
+      partyIndex: assignedSlots[i] !== -1 ? assignedSlots[i] : i,
+      percentage: 0,
+      ...rest,
+    };
+  });
 };
 
 export const epochToLocalTime = (epoch: number): string => {
@@ -177,6 +220,48 @@ export const translatedPlayerName = (
   return `[${partySlotData ? partySlotIndex + 1 : "Guest"}]` + " " + name;
 };
 
+/**
+ * Finds the party slot index (0-3) for a player by matching against partyData.
+ * When partyData was provided to formatInPartyOrder, the slot is pre-assigned
+ * and stored in player.partyIndex. Otherwise falls back to direct search.
+ */
+export const findPartySlotIndex = (
+  player: ComputedPlayerState | { index: number; partyIndex?: number; characterType: CharacterType },
+  partyData: Array<PlayerData | null>
+): number => {
+  // If partyIndex was already greedily assigned by formatInPartyOrder, use it directly.
+  // Also verify it actually matches the character type at that slot.
+  if (
+    player.partyIndex !== undefined &&
+    player.partyIndex >= 0 &&
+    player.partyIndex < 4
+  ) {
+    const slotData = partyData[player.partyIndex];
+    if (
+      slotData &&
+      typeof slotData.characterType === 'string' &&
+      typeof player.characterType === 'string' &&
+      slotData.characterType === player.characterType
+    ) {
+      return player.partyIndex;
+    }
+  }
+
+  // Fallback: try actor index, then character type (for legacy paths without pre-assignment)
+  const actorIdx = partyData.findIndex(
+    (partyMember) => partyMember?.actorIndex === player.index
+  );
+  if (actorIdx !== -1) return actorIdx;
+
+  const charIdx = partyData.findIndex(
+    (partyMember) =>
+      typeof partyMember?.characterType === 'string' &&
+      typeof player.characterType === 'string' &&
+      partyMember.characterType === player.characterType
+  );
+  return charIdx;
+};
+
 export const sortPlayers = (players: ComputedPlayerState[], sortType: SortType, sortDirection: SortDirection) => {
   players.sort((a, b) => {
     if (sortType === MeterColumns.Name) {
@@ -231,12 +316,12 @@ export const exportSimpleEncounterToClipboard = (
 
   const encounterData = [encounterHeader, encounterValues].join("\n");
 
-  const orderedPlayers = formatInPartyOrder(encounterState.party);
+  const orderedPlayers = formatInPartyOrder(encounterState.party, partyData);
 
-  const players: Array<ComputedPlayerState> = orderedPlayers.map((playerData) => {
+  const players: Array<ComputedPlayerState> = orderedPlayers.map((pd) => {
     return {
-      ...playerData,
-      percentage: (playerData.totalDamage / encounterState.totalDamage) * 100,
+      ...pd,
+      percentage: (pd.totalDamage / encounterState.totalDamage) * 100,
     };
   });
 
@@ -255,7 +340,7 @@ export const exportSimpleEncounterToClipboard = (
 
       computedSkills.sort((a, b) => b.totalDamage - a.totalDamage);
 
-      const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+      const partySlotIndex = findPartySlotIndex(player, partyData);
 
       return [
         translatedPlayerName(partySlotIndex, partyData[partySlotIndex], player),
@@ -290,12 +375,12 @@ export const exportFullEncounterToClipboard = (
   const encounterData = [encounterHeader, encounterValues].join("\n");
 
   const playerHeader = "Name, DMG, DPS, %";
-  const orderedPlayers = formatInPartyOrder(encounterState.party);
+  const orderedPlayers = formatInPartyOrder(encounterState.party, partyData);
 
-  const players: Array<ComputedPlayerState> = orderedPlayers.map((playerData) => {
+  const players: Array<ComputedPlayerState> = orderedPlayers.map((pd) => {
     return {
-      ...playerData,
-      percentage: (playerData.totalDamage / encounterState.totalDamage) * 100,
+      ...pd,
+      percentage: (pd.totalDamage / encounterState.totalDamage) * 100,
     };
   });
 
@@ -311,7 +396,7 @@ export const exportFullEncounterToClipboard = (
         };
       });
 
-      const partySlotIndex = partyData.findIndex((partyMember) => partyMember?.actorIndex === player.index);
+      const partySlotIndex = findPartySlotIndex(player, partyData);
 
       computedSkills.sort((a, b) => b.totalDamage - a.totalDamage);
 
