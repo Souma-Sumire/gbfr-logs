@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api";
 import { appWindow } from "@tauri-apps/api/window";
 import { Fragment, useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import toast from "react-hot-toast";
 
 import getVersion from "@/hooks/getVersion";
 import { EncounterState, PlayerData, SortDirection, SortType } from "@/types";
@@ -90,6 +91,21 @@ export const Titlebar = ({
     exportFullEncounterToClipboard(sortType, sortDirection, encounterState, partyData);
   }, [encounterState]);
 
+  const handleDumpDebugInfo = useCallback(() => {
+    const debugInfo = {
+      timestamp: Date.now(),
+      encounterState,
+      partyData,
+    };
+    navigator.clipboard.writeText(JSON.stringify(debugInfo, null, 2))
+      .then(() => {
+        toast.success("Debug info copied! Paste it to Antigravity.");
+      })
+      .catch((err) => {
+        toast.error("Failed to copy debug info: " + err);
+      });
+  }, [encounterState, partyData]);
+
   return (
     <div data-tauri-drag-region className="titlebar transparent-bg font-sm">
       <div data-tauri-drag-region className="titlebar-left">
@@ -109,6 +125,7 @@ export const Titlebar = ({
           <Menu.Dropdown>
             <Menu.Item onClick={handleSimpleEncounterCopy}>{t("ui.copy-to-clipboard-simple")}</Menu.Item>
             <Menu.Item onClick={handleFullEncounterCopy}>{t("ui.copy-to-clipboard-full")}</Menu.Item>
+            <Menu.Item onClick={handleDumpDebugInfo}>Dump Debug Info</Menu.Item>
           </Menu.Dropdown>
         </Menu>
         <Tooltip label="Pin window" color="dark">

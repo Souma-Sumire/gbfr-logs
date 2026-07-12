@@ -620,6 +620,7 @@ impl Parser {
         self.encounter.reset_player_data();
 
         if let Some(window) = &self.window_handle {
+            let _ = window.emit("encounter-party-update", &self.encounter.player_data);
             let _ = window.emit("on-area-enter", &self.derived_state);
         }
     }
@@ -817,30 +818,29 @@ impl Parser {
     }
 
     fn insert_player_data(&mut self, player_data: PlayerData, party_index: u8) {
-        // Insert into encounter player data array, using actor_index.
-        if !player_data.is_online && party_index == 0 {
-            self.encounter.player_data[0] = Some(player_data.clone());
-        } else {
-            for i in 1..=3 {
-                if let Some(player) = &self.encounter.player_data[i] {
-                    // If this is the same player, update it.
-                    if player.actor_index == player_data.actor_index {
-                        self.encounter.player_data[i] = Some(player_data.clone());
-                        break;
-                    }
+        // Remove the same player from other slots first to prevent duplicates.
+        for i in 0..4 {
+            if let Some(player) = &self.encounter.player_data[i] {
+                if player.actor_index == player_data.actor_index {
+                    self.encounter.player_data[i] = None;
+                }
+            }
+        }
 
-                    // If the actor index we're trying to insert is lower than the current slot's actor index,
-                    // then we need to shift the rest of the array to the right.
-                    if player_data.actor_index < player.actor_index {
-                        self.encounter.player_data[i..].rotate_right(1);
-                        self.encounter.player_data[i] = Some(player_data.clone());
-                        break;
-                    }
-                } else {
-                    self.encounter.player_data[i] = Some(player_data.clone());
+        // Allocate slot. If party_index is valid and free, use it; otherwise find the first free slot.
+        let mut target_index = party_index as usize;
+        if target_index >= 4 || self.encounter.player_data[target_index].is_some() {
+            for i in 0..4 {
+                if self.encounter.player_data[i].is_none() {
+                    target_index = i;
                     break;
                 }
             }
+        }
+
+        // Write into the decided slot.
+        if target_index < 4 {
+            self.encounter.player_data[target_index] = Some(player_data);
         }
 
         if let Some(window) = &self.window_handle {

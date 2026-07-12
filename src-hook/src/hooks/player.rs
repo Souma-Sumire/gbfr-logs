@@ -25,7 +25,7 @@ const PLAYER_KEY_OFFSET: usize = 0x5EA8;
 const IS_ONLINE_OFFSET: usize = 0x1C8;
 const CHARACTER_NAME_OFFSET: usize = 0x1E8;
 const DISPLAY_NAME_OFFSET: usize = 0x208;
-const PARTY_INDEX_OFFSET: usize = 0x22C;
+const PARTY_INDEX_OFFSET: usize = 0x230;
 const VBUFFER_INLINE_CAPACITY: usize = 0x0F;
 const MAX_PLAYER_NAME_BYTES: usize = 0x100;
 const INVALID_PLAYER_KEY: u32 = 0x887A_E0B0;
@@ -173,6 +173,59 @@ pub fn identity_event_for_actor(
     }
 
     let actor_address = actor as usize;
+
+    let sigil_offset = crate::hooks::globals::SIGIL_OFFSET.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    
+    let mut sigil_data_ptr = 0usize;
+    let mut bytes_read = 0usize;
+    let has_sigil_data = if sigil_offset != 0 {
+        let _ = unsafe {
+            ReadProcessMemory(
+                HANDLE(-1),
+                actor.byte_add(sigil_offset).cast::<c_void>(),
+                (&mut sigil_data_ptr as *mut usize).cast::<c_void>(),
+                std::mem::size_of::<usize>(),
+                Some(&mut bytes_read),
+            )
+        };
+        sigil_data_ptr != 0 && bytes_read == std::mem::size_of::<usize>()
+    } else {
+        false
+    };
+
+    let (is_online, party_index) = if has_sigil_data {
+        let mut is_online_val = 0u32;
+        let _ = unsafe {
+            ReadProcessMemory(
+                HANDLE(-1),
+                (sigil_data_ptr as *const u8).byte_add(0x1C8).cast::<c_void>(),
+                (&mut is_online_val as *mut u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+                None,
+            )
+        };
+        let is_online = is_online_val == 1;
+
+        let mut party_index_val = 0u32;
+        let _ = unsafe {
+            ReadProcessMemory(
+                HANDLE(-1),
+                (sigil_data_ptr as *const u8).byte_add(PARTY_INDEX_OFFSET).cast::<c_void>(),
+                (&mut party_index_val as *mut u32).cast::<c_void>(),
+                std::mem::size_of::<u32>(),
+                None,
+            )
+        };
+        
+        let mut party_index = party_index_val as u8;
+        if party_index > 3 {
+            party_index = 1;
+        }
+        (is_online, party_index)
+    } else {
+        (false, 1u8)
+    };
+
     let cached_key = ACTOR_KEYS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -180,18 +233,15 @@ pub fn identity_event_for_actor(
         .get(&actor_address)
         .copied();
 
-    let (player_key, identity) = if let Some(player_key) = cached_key {
-        let identity = IDENTITIES
+    let mut identity_opt = if let Some(player_key) = cached_key {
+        IDENTITIES
             .get_or_init(|| Mutex::new(IdentityStore::default()))
             .lock()
             .expect("player identity map lock poisoned")
             .by_key
             .get(&player_key)
-            .cloned()?;
-        (player_key, identity)
+            .cloned()
     } else {
-        let player_key = read_actor_player_key(actor)?;
-        let identity = IDENTITIES
             .get_or_init(|| Mutex::new(IdentityStore::default()))
             .lock()
             .expect("player identity map lock poisoned")
@@ -213,7 +263,7 @@ pub fn identity_event_for_actor(
         (player_key, identity)
     };
 
-    let _ = player_key;
+    let identity = match identity_opt {
 
     Some(PlayerIdentityEvent {
         character_name: identity.character_name,
